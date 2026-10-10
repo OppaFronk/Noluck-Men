@@ -20,8 +20,12 @@ RULES:
 2. If critical information (evacuation location, official contact number,
    specific zone) is omitted from the raw text, explicitly list it in
    "missing_warnings".
-3. Categorize crisis_type as: "FLOOD", "FIRE", "SECURITY", "BLACKOUT", or
-   "GENERAL".
+3. Categorize crisis_type by what the raw text describes:
+   - "FIRE": sunog, apoy, fire, bumbero, smoke.
+   - "FLOOD": baha, flood, rising river or dam water, tsunami, storm surge.
+   - "SECURITY": armed persons, shooting, robbery, bomb threat, lockdown.
+   - "BLACKOUT": power interruption, brownout, kuryente outage.
+   - "GENERAL": typhoon, earthquake, volcano, or anything else.
 4. Set "bantay_state" to:
    - "ALERT": active life-threatening emergency (evacuation, active fire,
      flash flood).
@@ -29,10 +33,10 @@ RULES:
      unverified rumor.
    - "INFO": non-life-threatening utility update (scheduled blackout,
      advisory).
-5. Write summary, bantay_speech, every checklist step, and every warning in
-   ALL THREE languages: natural Filipino/Tagalog ("en" is English, "tl" is
-   Tagalog, "ceb" is Cebuano/Bisaya). Do not copy one language into another
-   field — translate.
+5. "summary", "bantay_speech", and the "text" of every checklist step and
+   warning are ALWAYS objects {"en":"...","tl":"...","ceb":"..."} — never a
+   plain string. "en" is English, "tl" is Tagalog/Filipino, "ceb" is
+   Cebuano/Bisaya. Translate; do not copy one language into another field.
 6. action_checklist: 3 prioritized, situation-specific immediate steps
    (max 5), priority starting at 1, unique. state always "pending".
 7. Return ONLY raw valid JSON. No markdown wrappers, no extra text.
@@ -55,13 +59,14 @@ REQUIRED JSON SCHEMA (fixed key order):
 ''';
 
 /// Low temperature for factual fidelity (research R3).
-/// maxTokens capped at 256: the freeform schema fits well under this, and a
-/// lower cap avoids the model rambling to the old 768 limit when it does not
-/// emit a clean stop (grammar is disabled).
+/// The trilingual envelope (3 summaries, 3 speeches, 3+ steps and warnings in
+/// en/tl/ceb) is ~700-1000 tokens; a smaller cap truncates the JSON and every
+/// run falls back to the skeleton. The engine stops as soon as the top-level
+/// object closes, so the cap only bounds runaway output.
 const SamplingConfig kDefaultSampling = SamplingConfig(
   temperature: 0.3,
   topP: 0.9,
-  maxTokens: 256,
+  maxTokens: 1280,
 );
 
 /// Cap for the R4 fallback lever (0.5B model, ≤120-token outputs).
@@ -72,14 +77,24 @@ const SamplingConfig kCappedSampling = SamplingConfig(
 );
 
 class BantayPrompt {
-  /// User turn for the enrich stage.
-  static String userTurn(String sourceText) =>
+  /// User turn for the enrich stage. [crisisHint] is the deterministic
+  /// fast-path category; small models often mislabel the crisis (e.g. a
+  /// "sunog" SMS as FLOOD) without it.
+  static String userTurn(String sourceText, {String? crisisHint}) =>
+      '${_hint(crisisHint)}'
       'Analyze this advisory and return the JSON object:\n---\n$sourceText\n---';
 
   /// Repair stage: same input plus the exact validation failures.
-  static String repairTurn(String sourceText, List<String> errors) =>
+  static String repairTurn(String sourceText, List<String> errors,
+          {String? crisisHint}) =>
       'Your previous JSON failed validation with these errors:\n'
       '- ${errors.join('\n- ')}\n\n'
+      '${_hint(crisisHint)}'
       'Return a corrected JSON object only, following the schema exactly:\n'
       '---\n$sourceText\n---';
+
+  static String _hint(String? crisisHint) => crisisHint == null
+      ? ''
+      : 'Keyword pre-check classified this as crisis_type "$crisisHint". '
+          'Keep it unless the text clearly describes a different crisis.\n\n';
 }

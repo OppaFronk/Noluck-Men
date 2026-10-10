@@ -19,6 +19,7 @@
 //                         1 = model load failed, 2 = context alloc failed (oom)
 //   sr_setup         -> 0 ok, -1 no engine, -2 chain alloc failed, -3 grammar build failed
 //   sr_feed          -> 0 ok, <0 decode failed
+//   sr_feed_chat     -> 0 ok, -1 decode failed, -4 chat template failed
 //   sr_sample        -> >0 bytes written to out, 0 = EOS/finished, <0 error (-2 decode)
 //   sr_free          -> void
 
@@ -83,6 +84,38 @@ class StderrCapture {
   int saved_ = -1;
   int read_fd_ = -1;
 };
+
+
+// Tokenizes [text] and decodes it into the KV cache. parse_special must be
+// true for chat-templated prompts so markers like <|im_start|> become
+// control tokens instead of literal text the model never learned to follow.
+int32_t feed_text(SrEngine* e, const char* text, bool parse_special) {
+  const int32_t len = static_cast<int32_t>(std::strlen(text));
+  // Over-allocate: each token is at least 1 byte, so len is a safe upper bound.
+  std::vector<llama_token> toks(len + 8);
+  int32_t n = llama_tokenize(e->vocab, text, len, toks.data(),
+                             static_cast<int32_t>(toks.size()), true,
+                             parse_special);
+  if (n < 0) {
+    // Buffer too small: -n is the required count. Resize and retry once.
+    toks.resize(-n);
+    n = llama_tokenize(e->vocab, text, len, toks.data(),
+                       static_cast<int32_t>(toks.size()), true, parse_special);
+    if (n < 0) return -1;
+  }
+  if (n == 0) return -1;
+  if (static_cast<uint32_t>(n) >= llama_n_ctx(e->ctx)) {
+    __android_log_print(ANDROID_LOG_ERROR, "llama",
+                        "prompt (%d tokens) does not fit n_ctx=%u", n,
+                        llama_n_ctx(e->ctx));
+    return -1;
+  }
+
+  llama_batch batch = llama_batch_get_one(toks.data(), n);
+  if (llama_decode(e->ctx, batch) != 0) return -1;
+  e->prompt_fed = true;
+  return 0;
+}
 
 }  // namespace
 
@@ -160,24 +193,32 @@ int32_t sr_setup(SrEngine* e, const char* grammar_str, const char* grammar_root,
 
 int32_t sr_feed(SrEngine* e, const char* prompt) {
   if (!e || !e->ctx || !prompt) return -1;
-  const int32_t len = static_cast<int32_t>(std::strlen(prompt));
-  // Over-allocate: each token is at least 1 byte, so len is a safe upper bound.
-  std::vector<llama_token> toks(len + 8);
-  int32_t n = llama_tokenize(e->vocab, prompt, len, toks.data(),
-                             static_cast<int32_t>(toks.size()), true, false);
-  if (n < 0) {
-    // Buffer too small: -n is the required count. Resize and retry once.
-    toks.resize(-n);
-    n = llama_tokenize(e->vocab, prompt, len, toks.data(),
-                       static_cast<int32_t>(toks.size()), true, false);
-    if (n < 0) return -1;
-  }
-  if (n == 0) return -1;
+  return feed_text(e, prompt, false);
+}
 
-  llama_batch batch = llama_batch_get_one(toks.data(), n);
-  if (llama_decode(e->ctx, batch) != 0) return -1;
-  e->prompt_fed = true;
-  return 0;
+// Wraps system + user in the model's own chat template (ChatML for Qwen2.5,
+// Llama-3 headers for Llama 3.2, ...) and ends with the assistant header so
+// the instruct model answers instead of continuing the raw prompt text.
+int32_t sr_feed_chat(SrEngine* e, const char* system, const char* user) {
+  if (!e || !e->ctx || !system || !user) return -1;
+  const char* tmpl = llama_model_chat_template(e->model, nullptr);
+  if (!tmpl) tmpl = "chatml";
+  const llama_chat_message msgs[2] = {{"system", system}, {"user", user}};
+  std::vector<char> buf(2 * (std::strlen(system) + std::strlen(user)) + 512);
+  int32_t n = llama_chat_apply_template(tmpl, msgs, 2, true, buf.data(),
+                                        static_cast<int32_t>(buf.size()));
+  if (n > static_cast<int32_t>(buf.size())) {
+    buf.resize(n + 1);
+    n = llama_chat_apply_template(tmpl, msgs, 2, true, buf.data(),
+                                  static_cast<int32_t>(buf.size()));
+  }
+  if (n < 0) {
+    __android_log_print(ANDROID_LOG_ERROR, "llama",
+                        "llama_chat_apply_template failed (%d)", n);
+    return -4;
+  }
+  std::string prompt(buf.data(), n);
+  return feed_text(e, prompt.c_str(), true);
 }
 
 int32_t sr_sample(SrEngine* e, char* out, int32_t out_cap) {
@@ -186,7 +227,8 @@ int32_t sr_sample(SrEngine* e, char* out, int32_t out_cap) {
   const llama_token token = llama_sampler_sample(e->chain, e->ctx, -1);
   llama_sampler_accept(e->chain, token);
 
-  if (e->eos >= 0 && token == e->eos) return 0;  // EOS -> caller stops
+  // End-of-generation covers EOS and chat end markers (<|im_end|>, <|eot_id|>).
+  if (llama_vocab_is_eog(e->vocab, token)) return 0;
 
   int32_t n = llama_token_to_piece(e->vocab, token, out, out_cap, 0, false);
   if (n < 0) {
