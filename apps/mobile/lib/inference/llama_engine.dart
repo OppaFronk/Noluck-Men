@@ -29,6 +29,11 @@ typedef _SetupDart = int Function(
 typedef _FeedNative = Int32 Function(Pointer<Void> engine, Pointer<Utf8> prompt);
 typedef _FeedDart = int Function(Pointer<Void>, Pointer<Utf8>);
 
+typedef _FeedChatNative = Int32 Function(
+    Pointer<Void> engine, Pointer<Utf8> system, Pointer<Utf8> user);
+typedef _FeedChatDart = int Function(
+    Pointer<Void>, Pointer<Utf8>, Pointer<Utf8>);
+
 typedef _SampleNative = Int32 Function(
     Pointer<Void> engine, Pointer<Uint8> out, Int32 outCap);
 typedef _SampleDart = int Function(Pointer<Void>, Pointer<Uint8>, int);
@@ -43,12 +48,15 @@ class _Shim {
       : create = lib.lookupFunction<_CreateNative, _CreateDart>('sr_create'),
         setup = lib.lookupFunction<_SetupNative, _SetupDart>('sr_setup'),
         feed = lib.lookupFunction<_FeedNative, _FeedDart>('sr_feed'),
+        feedChat =
+            lib.lookupFunction<_FeedChatNative, _FeedChatDart>('sr_feed_chat'),
         sample = lib.lookupFunction<_SampleNative, _SampleDart>('sr_sample'),
         free = lib.lookupFunction<_FreeNative, _FreeDart>('sr_free');
 
   final _CreateDart create;
   final _SetupDart setup;
   final _FeedDart feed;
+  final _FeedChatDart feedChat;
   final _SampleDart sample;
   final _FreeDart free;
 }
@@ -59,9 +67,13 @@ int _threadsForRequest() {
 }
 
 int _nCtxFor(InferenceRequest request) {
-  // Room for the prompt (~a few hundred tokens) + generation + headroom.
-  final ctx = request.sampling.maxTokens + 1536;
-  return ctx < 2048 ? 2048 : ctx;
+  // Prompt (system + user, ~1 token per 2 chars worst case for Tagalog /
+  // Cebuano) + generation + chat-template headroom. A fixed budget let long
+  // pasted advisories overflow the context and fail at prompt decode.
+  final promptChars = request.systemPrompt.length + request.userText.length;
+  final ctx = (promptChars ~/ 2) + request.sampling.maxTokens + 256;
+  if (ctx < 2048) return 2048;
+  return ctx > 8192 ? 8192 : ctx;
 }
 
 /// T017 — llama.cpp engine, bound in-process via Dart FFI to the native shim.
@@ -103,6 +115,7 @@ class LlamaCppEngine implements InferenceEngine {
         // Validate the shim surface before handing the engine out.
         lib.lookupFunction<_CreateNative, _CreateDart>('sr_create');
         lib.lookupFunction<_SampleNative, _SampleDart>('sr_sample');
+        lib.lookupFunction<_FeedChatNative, _FeedChatDart>('sr_feed_chat');
         return lib;
       } on ArgumentError {
         continue;
@@ -268,15 +281,19 @@ class LlamaCppEngine implements InferenceEngine {
         return;
       }
 
-      // 3) Encode the prompt (system + user turn) and prime the KV cache.
-      final prompt = '${request.systemPrompt}\n${request.userText}';
-      final cPrompt = prompt.toNativeUtf8();
+      // 3) Wrap system + user turn in the model's chat template and prime
+      //    the KV cache. Plain concatenation makes an instruct model treat
+      //    the advisory as text to continue rather than a message to answer.
+      final cSystem = request.systemPrompt.toNativeUtf8();
+      final cUser = request.userText.toNativeUtf8();
       try {
-        rc = shim.feed(engine, cPrompt);
+        rc = shim.feedChat(engine, cSystem, cUser);
       } finally {
-        calloc.free(cPrompt);
+        calloc.free(cSystem);
+        calloc.free(cUser);
       }
-      debugPrint('llm: sr_feed rc=$rc promptChars=${prompt.length}');
+      debugPrint('llm: sr_feed_chat rc=$rc promptChars='
+          '${request.systemPrompt.length + request.userText.length}');
       if (rc != 0) {
         yield const FailedEvent('grammar_violation', 'Prompt decode failed.');
         return;

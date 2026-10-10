@@ -47,6 +47,7 @@ class EnrichmentPipeline {
     required String analysisId,
     required String sourceText,
     required SourceDescriptor source,
+    String? crisisHint,
     void Function(String rawSoFar)? onProgress,
   }) async {
     var errors = <String>[];
@@ -59,8 +60,9 @@ class EnrichmentPipeline {
         analysisId: analysisId,
         systemPrompt: kBantaySystemPrompt,
         userText: isRepair
-            ? BantayPrompt.repairTurn(sourceText, errors)
-            : BantayPrompt.userTurn(sourceText),
+            ? BantayPrompt.repairTurn(sourceText, errors,
+                crisisHint: crisisHint)
+            : BantayPrompt.userTurn(sourceText, crisisHint: crisisHint),
         sampling: kDefaultSampling,
         stage: isRepair ? InferenceStage.repair : InferenceStage.enrich,
         repairErrors: errors,

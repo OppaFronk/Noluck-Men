@@ -188,6 +188,7 @@ class AnalyzeAdvisory {
         type: prepared.sourceType.name,
         text: prepared.effectiveText,
       ),
+      crisisHint: fast.crisisType.contractName,
       onProgress: onEnrichmentProgress,
     );
 
